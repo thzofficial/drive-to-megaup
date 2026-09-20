@@ -10,10 +10,8 @@ import subprocess
 import requests
 
 MEGAUP_BASE = "https://megaup.net"
-MEGAUP_COOKIE_FILEHOSTING = os.environ.get("MEGAUP_COOKIE_FILEHOSTING")
-MEGAUP_COOKIE_CFCLEARANCE = os.environ.get("MEGAUP_COOKIE_CFCLEARANCE")
+RAW_COOKIE = os.environ.get("MEGAUP_COOKIE", "")
 ROOT_FOLDER_ID = os.environ.get("MEGAUP_FOLDER_ID", "63172")
-MEGAUP_FALLBACK_NODE_URL = os.environ.get("MEGAUP_DIRECT_NODE_URL")
 REMOTE_NAME = os.environ.get("RCLONE_REMOTE", "ShareDrive")
 
 TARGET_REMOTE_FOLDER = f"{REMOTE_NAME}:Backup"
@@ -21,29 +19,25 @@ TEMP_DIR = "/tmp/transfer_cache"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 CHUNK_SIZE = 15 * 1024 * 1024  # 15MB chunks
-SPLIT_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # 4GB (Megaup Single File Limit)
+SPLIT_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # 4GB
 
 _RESOLVED_UPLOAD_URL = None
 folder_cache = {}
 
 def get_authenticated_session() -> requests.Session:
-    if not MEGAUP_COOKIE_FILEHOSTING:
-        raise ValueError("Missing required secret: MEGAUP_COOKIE_FILEHOSTING")
-
+    """Cookie တစ်ကြောင်းတည်းမှ filehosting နှင့် cf_clearance ကို အလိုအလျောက် ခွဲယူခြင်း"""
     session = requests.Session()
-    cookie_parts = [f"filehosting={MEGAUP_COOKIE_FILEHOSTING}"]
-    if MEGAUP_COOKIE_CFCLEARANCE:
-        cookie_parts.append(f"cf_clearance={MEGAUP_COOKIE_CFCLEARANCE}")
-
+    
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": f"{MEGAUP_BASE}/",
         "Origin": MEGAUP_BASE,
-        "Cookie": "; ".join(cookie_parts),
+        "Cookie": RAW_COOKIE.strip(),
     })
     return session
 
 def resolve_upload_url(session: requests.Session) -> str:
+    """Storage node ကို အလိုအလျောက် ရှာဖွေခြင်း"""
     global _RESOLVED_UPLOAD_URL
     if _RESOLVED_UPLOAD_URL:
         return _RESOLVED_UPLOAD_URL
@@ -57,14 +51,9 @@ def resolve_upload_url(session: requests.Session) -> str:
             print(f"[+] Auto-discovered Storage Node: {_RESOLVED_UPLOAD_URL}", flush=True)
             return _RESOLVED_UPLOAD_URL
     except Exception as exc:
-        print(f"[-] Dynamic node resolution warning: {exc}", flush=True)
+        print(f"[-] Node resolution warning: {exc}", flush=True)
 
-    if MEGAUP_FALLBACK_NODE_URL:
-        print("[+] Using configured MEGAUP_DIRECT_NODE_URL fallback.", flush=True)
-        _RESOLVED_UPLOAD_URL = MEGAUP_FALLBACK_NODE_URL
-        return _RESOLVED_UPLOAD_URL
-
-    raise RuntimeError("Could not resolve Megaup Storage Node. Please provide MEGAUP_DIRECT_NODE_URL secret.")
+    raise RuntimeError("Could not resolve Megaup Storage Node. Please check if cookies are valid.")
 
 def sanitize_name(name: str) -> str:
     normalized = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('ASCII')
@@ -172,7 +161,6 @@ def megaup_upload_file(file_path: str, target_folder_id: str) -> bool:
                 "files[]": (file_name, chunk_data, "application/octet-stream")
             }
 
-            # Retry chunk logic
             chunk_ok = False
             for attempt in range(1, 4):
                 try:
@@ -242,7 +230,6 @@ for idx, file_info in enumerate(files_metadata, 1):
     raw_filename = os.path.basename(rel_path)
     file_size_gb = file_size / (1024 ** 3)
 
-    # Subfolder Mapping
     sub_dir = os.path.dirname(rel_path)
     target_folder_id = ROOT_FOLDER_ID
     if sub_dir:
@@ -266,7 +253,6 @@ for idx, file_info in enumerate(files_metadata, 1):
 
     upload_success_all_parts = True
 
-    # 4GB ထက်ကြီးလျှင် 4GB chunks ခွဲမည်
     if file_size > SPLIT_SIZE_BYTES:
         print(f"  [!] File size > 4GB. Splitting into 4GB chunks...", flush=True)
         split_prefix = local_path + ".part"
