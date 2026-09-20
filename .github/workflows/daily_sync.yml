@@ -2,8 +2,9 @@ name: Daily Drive Backup to MegaUp
 
 on:
   schedule:
+    # နေ့စဉ် ည ၁၂:၀၀ နာရီတိုင်း အလိုအလျောက် စစ်ဆေးရန် (UTC 00:00)
     - cron: '0 0 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # လိုအပ်ပါက Actions tab မှ ကိုယ်တိုင် ခလုတ်နှိပ်ပြီး run ရန်
 
 jobs:
   sync:
@@ -28,16 +29,16 @@ jobs:
           CONFIG_B64: ${{ secrets.RCLONE_CONFIG_DATA }}
         run: |
           mkdir -p ~/.config/rclone
-          # Python ဖြင့် Base64 decode လုပ်ပြီး rclone.conf ဖိုင်အဖြစ် သိမ်းဆည်းခြင်း
           python -c "import os, base64; open(os.path.expanduser('~/.config/rclone/rclone.conf'), 'wb').write(base64.b64decode(os.environ['CONFIG_B64']))"
-          
           echo "=== Registered Rclone Remotes ==="
           rclone listremotes
 
       - name: Run Transfer & Cleanup
         env:
           MEGAUP_KEY1: ${{ secrets.MEGAUP_KEY1 }}
+          MEGAUP_KEY2: ${{ secrets.MEGAUP_KEY2 }}
           MEGAUP_FOLDER_ID: "63172"
           RCLONE_REMOTE: "ShareDrive"
+          PYTHONUNBUFFERED: "1"
         run: |
-          python transfer.py
+          python -u transfer.py
