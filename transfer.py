@@ -25,7 +25,6 @@ _RESOLVED_UPLOAD_URL = None
 folder_cache = {}
 
 def get_authenticated_session() -> requests.Session:
-    """Cookie တစ်ကြောင်းတည်းမှ filehosting နှင့် cf_clearance ကို ပို့ဆောင်ခြင်း"""
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -36,7 +35,7 @@ def get_authenticated_session() -> requests.Session:
     return session
 
 def resolve_upload_url(session: requests.Session) -> str:
-    """Storage node ကို Pattern မျိုးစုံဖြင့် အလိုအလျောက် ရှာဖွေခြင်း"""
+    """Storage node ကို HTML Form action နှင့် JavaScript config များမှ ရှာဖွေခြင်း"""
     global _RESOLVED_UPLOAD_URL
     if _RESOLVED_UPLOAD_URL:
         return _RESOLVED_UPLOAD_URL
@@ -52,33 +51,48 @@ def resolve_upload_url(session: requests.Session) -> str:
             if not url.endswith("/ajax/file_upload_handler"):
                 url = url.rstrip('/') + "/ajax/file_upload_handler"
             _RESOLVED_UPLOAD_URL = url
-            print(f"[+] Auto-discovered Storage Node (Pattern 1): {_RESOLVED_UPLOAD_URL}", flush=True)
+            print(f"[+] Storage Node Discovered (Pattern 1): {_RESOLVED_UPLOAD_URL}", flush=True)
             return _RESOLVED_UPLOAD_URL
 
-        # ၂။ YetiShare uploadUrl javascript variable ရှာဖွေခြင်း
-        match2 = re.search(r'uploadUrl\s*=\s*[\'"]([^\'"]+)[\'"]', html_text)
+        # ၂။ Form Action ထဲရှိ Upload Handler URL ရှာဖွေခြင်း
+        match2 = re.search(r'action=[\'"]([^\'"]*file_upload_handler[^\'"]*)[\'"]', html_text, re.IGNORECASE)
         if match2:
-            _RESOLVED_UPLOAD_URL = match2.group(1).replace("&amp;", "&")
-            print(f"[+] Auto-discovered Storage Node (uploadUrl variable): {_RESOLVED_UPLOAD_URL}", flush=True)
+            url = match2.group(1).replace("&amp;", "&")
+            if url.startswith("//"):
+                url = "https:" + url
+            elif url.startswith("/"):
+                url = MEGAUP_BASE + url
+            _RESOLVED_UPLOAD_URL = url
+            print(f"[+] Storage Node Discovered (Form Action): {_RESOLVED_UPLOAD_URL}", flush=True)
             return _RESOLVED_UPLOAD_URL
 
-        # ၃။ Generic file_upload_handler URL ရှာဖွေခြင်း
-        match3 = re.search(r'https?://[^\s\'"]+/ajax/file_upload_handler[^\s\'"]*', html_text)
+        # ၃။ uploadUrl javascript variable ရှာဖွေခြင်း
+        match3 = re.search(r'uploadUrl\s*[:=]\s*[\'"]([^\'"]+)[\'"]', html_text)
         if match3:
-            _RESOLVED_UPLOAD_URL = match3.group(0).replace("&amp;", "&").split("'")[0].split('"')[0]
-            print(f"[+] Auto-discovered Storage Node (Generic handler): {_RESOLVED_UPLOAD_URL}", flush=True)
+            url = match3.group(1).replace("&amp;", "&")
+            if url.startswith("//"):
+                url = "https:" + url
+            elif url.startswith("/"):
+                url = MEGAUP_BASE + url
+            _RESOLVED_UPLOAD_URL = url
+            print(f"[+] Storage Node Discovered (uploadUrl variable): {_RESOLVED_UPLOAD_URL}", flush=True)
             return _RESOLVED_UPLOAD_URL
 
-        # မတွေ့ပါက debug အချက်အလက် ထုတ်ပြခြင်း
-        title_match = re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE)
-        page_title = title_match.group(1) if title_match else "No Title"
-        print(f"[-] Node not matched. Page Title: '{page_title}'", flush=True)
-        print(f"[-] HTML Snippet: {html_text[:350].strip()}", flush=True)
+        # ၄။ မည်သည့် file_upload_handler link မဆို ရှာဖွေခြင်း
+        match4 = re.search(r'https?://[^\s\'"]+/ajax/file_upload_handler[^\s\'"]*', html_text)
+        if match4:
+            _RESOLVED_UPLOAD_URL = match4.group(0).replace("&amp;", "&").split("'")[0].split('"')[0]
+            print(f"[+] Storage Node Discovered (Generic handler): {_RESOLVED_UPLOAD_URL}", flush=True)
+            return _RESOLVED_UPLOAD_URL
 
     except Exception as exc:
-        print(f"[-] Node resolution exception: {exc}", flush=True)
+        print(f"[-] Node resolution check warning: {exc}", flush=True)
 
-    raise RuntimeError("Could not resolve Megaup Storage Node. See debug info above.")
+    # HTML ထဲတွင် သီးသန့် node မပါရှိပါက YetiShare standard endpoint သို့ fallback လုပ်ခြင်း
+    fallback_url = f"{MEGAUP_BASE}/ajax/file_upload_handler"
+    print(f"[*] Using Default MegaUp Upload Endpoint: {fallback_url}", flush=True)
+    _RESOLVED_UPLOAD_URL = fallback_url
+    return _RESOLVED_UPLOAD_URL
 
 def sanitize_name(name: str) -> str:
     normalized = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('ASCII')
@@ -120,7 +134,7 @@ def create_or_get_folder(folder_name: str, parent_id: str = None) -> str:
             print(f"  [+] Created Folder '{clean_folder}' -> ID: {new_id}", flush=True)
             return new_id
     except Exception as exc:
-        print(f"  [-] Folder create warning for '{clean_folder}': {exc}", flush=True)
+        print(f"  [-] Folder create notice for '{clean_folder}': {exc}", flush=True)
 
     return parent_id
 
@@ -310,7 +324,6 @@ for idx, file_info in enumerate(files_metadata, 1):
         if os.path.exists(local_path):
             os.remove(local_path)
 
-    # အောင်မြင်မှသာ Drive ထဲက ဖျက်ခြင်း
     if upload_success_all_parts:
         print("  -> Deleting original file from Google Shared Drive...", flush=True)
         del_cmd = subprocess.run(["rclone", "deletefile", remote_file])
