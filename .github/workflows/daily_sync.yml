@@ -34,9 +34,7 @@ jobs:
 
       - name: Run Transfer & Cleanup
         env:
-          MEGAUP_COOKIE_FILEHOSTING: ${{ secrets.MEGAUP_COOKIE_FILEHOSTING }}
-          MEGAUP_COOKIE_CFCLEARANCE: ${{ secrets.MEGAUP_COOKIE_CFCLEARANCE }}
-          MEGAUP_DIRECT_NODE_URL: ${{ secrets.MEGAUP_DIRECT_NODE_URL }}
+          MEGAUP_COOKIE: ${{ secrets.MEGAUP_COOKIE }}
           MEGAUP_FOLDER_ID: "63172"
           RCLONE_REMOTE: "ShareDrive"
           PYTHONUNBUFFERED: "1"
