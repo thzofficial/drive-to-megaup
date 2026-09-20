@@ -25,9 +25,8 @@ _RESOLVED_UPLOAD_URL = None
 folder_cache = {}
 
 def get_authenticated_session() -> requests.Session:
-    """Cookie တစ်ကြောင်းတည်းမှ filehosting နှင့် cf_clearance ကို အလိုအလျောက် ခွဲယူခြင်း"""
+    """Cookie တစ်ကြောင်းတည်းမှ filehosting နှင့် cf_clearance ကို ပို့ဆောင်ခြင်း"""
     session = requests.Session()
-    
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": f"{MEGAUP_BASE}/",
@@ -37,23 +36,49 @@ def get_authenticated_session() -> requests.Session:
     return session
 
 def resolve_upload_url(session: requests.Session) -> str:
-    """Storage node ကို အလိုအလျောက် ရှာဖွေခြင်း"""
+    """Storage node ကို Pattern မျိုးစုံဖြင့် အလိုအလျောက် ရှာဖွေခြင်း"""
     global _RESOLVED_UPLOAD_URL
     if _RESOLVED_UPLOAD_URL:
         return _RESOLVED_UPLOAD_URL
 
     try:
         res = session.get(f"{MEGAUP_BASE}/", timeout=30)
-        res.raise_for_status()
-        match = re.search(r'https?://[a-zA-Z0-9_\-\.]+\.mupload\.store/ajax/file_upload_handler[^\s\'"]*', res.text)
-        if match:
-            _RESOLVED_UPLOAD_URL = match.group(0).replace("&amp;", "&")
-            print(f"[+] Auto-discovered Storage Node: {_RESOLVED_UPLOAD_URL}", flush=True)
-            return _RESOLVED_UPLOAD_URL
-    except Exception as exc:
-        print(f"[-] Node resolution warning: {exc}", flush=True)
+        html_text = res.text
 
-    raise RuntimeError("Could not resolve Megaup Storage Node. Please check if cookies are valid.")
+        # ၁။ mupload.store pattern ရှာဖွေခြင်း
+        match = re.search(r'https?://[a-zA-Z0-9_\-\.]+\.mupload\.store[^\s\'"]*', html_text)
+        if match:
+            url = match.group(0).replace("&amp;", "&").split("'")[0].split('"')[0]
+            if not url.endswith("/ajax/file_upload_handler"):
+                url = url.rstrip('/') + "/ajax/file_upload_handler"
+            _RESOLVED_UPLOAD_URL = url
+            print(f"[+] Auto-discovered Storage Node (Pattern 1): {_RESOLVED_UPLOAD_URL}", flush=True)
+            return _RESOLVED_UPLOAD_URL
+
+        # ၂။ YetiShare uploadUrl javascript variable ရှာဖွေခြင်း
+        match2 = re.search(r'uploadUrl\s*=\s*[\'"]([^\'"]+)[\'"]', html_text)
+        if match2:
+            _RESOLVED_UPLOAD_URL = match2.group(1).replace("&amp;", "&")
+            print(f"[+] Auto-discovered Storage Node (uploadUrl variable): {_RESOLVED_UPLOAD_URL}", flush=True)
+            return _RESOLVED_UPLOAD_URL
+
+        # ၃။ Generic file_upload_handler URL ရှာဖွေခြင်း
+        match3 = re.search(r'https?://[^\s\'"]+/ajax/file_upload_handler[^\s\'"]*', html_text)
+        if match3:
+            _RESOLVED_UPLOAD_URL = match3.group(0).replace("&amp;", "&").split("'")[0].split('"')[0]
+            print(f"[+] Auto-discovered Storage Node (Generic handler): {_RESOLVED_UPLOAD_URL}", flush=True)
+            return _RESOLVED_UPLOAD_URL
+
+        # မတွေ့ပါက debug အချက်အလက် ထုတ်ပြခြင်း
+        title_match = re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE)
+        page_title = title_match.group(1) if title_match else "No Title"
+        print(f"[-] Node not matched. Page Title: '{page_title}'", flush=True)
+        print(f"[-] HTML Snippet: {html_text[:350].strip()}", flush=True)
+
+    except Exception as exc:
+        print(f"[-] Node resolution exception: {exc}", flush=True)
+
+    raise RuntimeError("Could not resolve Megaup Storage Node. See debug info above.")
 
 def sanitize_name(name: str) -> str:
     normalized = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('ASCII')
