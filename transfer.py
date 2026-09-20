@@ -3,9 +3,9 @@ import re
 import glob
 import json
 import time
+import math
 import subprocess
 import requests
-from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 
 COOKIE_STRING = os.environ.get("MEGAUP_COOKIE", "")
 ROOT_FOLDER_ID = os.environ.get("MEGAUP_FOLDER_ID", "63172")
@@ -16,8 +16,8 @@ TEMP_DIR = "/tmp/transfer_cache"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 SPLIT_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # 4GB
+CHUNK_SIZE = 5 * 1024 * 1024  # 5MB chunks (Cloudflare limit ကျော်လွှားရန်)
 
-# Default YetiShare browser headers
 COMMON_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -31,17 +31,14 @@ session = requests.Session()
 session.headers.update(COMMON_HEADERS)
 
 def parse_upload_params():
-    """MegaUp ပင်မစာမျက်နှာမှ upload handler URL နှင့် session tokens များကို ရှာဖွေခြင်း"""
     print("[*] Fetching MegaUp Web Upload Session...", flush=True)
     try:
         r = session.get("https://megaup.net/", timeout=30)
         html = r.text
 
-        # YetiShare upload url format ရှာဖွေခြင်း
         upload_url_match = re.search(r'uploadUrl\s*=\s*[\'"]([^\'"]+)[\'"]', html)
         upload_url = upload_url_match.group(1) if upload_url_match else "https://megaup.net/core/page/ajax/file_upload_handler.ajax.php"
 
-        # cTracker သို့မဟုတ် session token ရှာဖွေခြင်း
         c_tracker_match = re.search(r'cTracker\s*=\s*[\'"]([^\'"]+)[\'"]', html)
         c_tracker = c_tracker_match.group(1) if c_tracker_match else ""
 
@@ -53,58 +50,60 @@ def parse_upload_params():
 
 UPLOAD_ENDPOINT, CTRACKER = parse_upload_params()
 
-def upload_file_web(file_path, folder_id, retries=3):
+def upload_file_chunked(file_path, folder_id, max_retries=3):
+    """5MB Chunks စီ ခွဲပို့သည့် YetiShare Web Upload Flow (SSL EOF Error ကင်းစင်စေသည်)"""
     file_name = os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+    total_chunks = math.ceil(file_size / CHUNK_SIZE)
+    
+    print(f"  -> Uploading '{file_name}' ({file_size / (1024*1024):.1f} MB) in {total_chunks} chunks...", flush=True)
 
-    for attempt in range(1, retries + 1):
-        try:
-            with open(file_path, "rb") as f:
-                fields = {
-                    "folder_id": str(folder_id),
-                    "cTracker": CTRACKER,
-                    "files[]": (file_name, f, "application/octet-stream")
-                }
-                encoder = MultipartEncoder(fields=fields)
+    with open(file_path, "rb") as f:
+        for chunk_idx in range(total_chunks):
+            chunk_data = f.read(CHUNK_SIZE)
+            start_byte = chunk_idx * CHUNK_SIZE
+            end_byte = start_byte + len(chunk_data) - 1
 
-                last_percent = [-10]
-                total_mb = encoder.len / (1024 * 1024)
+            headers = dict(COMMON_HEADERS)
+            # YetiShare / jQuery File Upload Standard Content-Range Header
+            headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{file_size}"
+            headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
 
-                def progress_callback(monitor):
-                    current_percent = int((monitor.bytes_read / monitor.len) * 100)
-                    if current_percent >= last_percent[0] + 10 or current_percent == 100:
-                        uploaded_mb = monitor.bytes_read / (1024 * 1024)
-                        print(f"    -> Uploading: {current_percent}% ({uploaded_mb:.1f}/{total_mb:.1f} MB)", flush=True)
-                        last_percent[0] = current_percent
+            fields = {
+                "folder_id": str(folder_id),
+                "cTracker": CTRACKER,
+            }
+            files = {
+                "files[]": (file_name, chunk_data, "application/octet-stream")
+            }
 
-                monitor = MultipartEncoderMonitor(encoder, progress_callback)
-                headers = dict(COMMON_HEADERS)
-                headers["Content-Type"] = monitor.content_type
-
-                r = session.post(UPLOAD_ENDPOINT, data=monitor, headers=headers, timeout=3600)
-
-            try:
-                res = r.json()
-                # YetiShare returns an array of uploaded files [{name, size, url, error...}]
-                if isinstance(res, list) and len(res) > 0:
-                    first = res[0]
-                    if "error" not in first:
-                        return {"_status": "success", "data": first}
+            # Retry logic per chunk
+            success = False
+            for attempt in range(1, max_retries + 1):
+                try:
+                    r = session.post(UPLOAD_ENDPOINT, data=fields, files=files, headers=headers, timeout=60)
+                    if r.status_code == 200:
+                        success = True
+                        break
                     else:
-                        print(f"    [-] MegaUp Upload Error: {first.get('error')}", flush=True)
-                elif isinstance(res, dict) and res.get("_status") == "success":
-                    return res
-                else:
-                    print(f"    [-] Response: {res}", flush=True)
-            except Exception:
-                print(f"    [-] Non-JSON response ({r.status_code}): {r.text[:250]}", flush=True)
+                        print(f"    [!] Chunk {chunk_idx + 1} returned status {r.status_code}. Retrying...", flush=True)
+                except Exception as err:
+                    print(f"    [!] Chunk {chunk_idx + 1} attempt {attempt} failed: {err}. Retrying in 5s...", flush=True)
+                    time.sleep(5)
 
-        except Exception as err:
-            print(f"    [!] Attempt {attempt}/{retries} failed ({err}). Retrying in 10s...", flush=True)
-            time.sleep(10)
+            if not success:
+                print(f"[-] Failed to upload chunk {chunk_idx + 1}/{total_chunks}.", flush=True)
+                return {"_status": "error"}
 
-    return {"_status": "error"}
+            # Progress log
+            percent = int(((chunk_idx + 1) / total_chunks) * 100)
+            if percent % 10 == 0 or chunk_idx == total_chunks - 1:
+                uploaded_mb = (end_byte + 1) / (1024 * 1024)
+                print(f"    -> Progress: {percent}% ({uploaded_mb:.1f}/{file_size / (1024*1024):.1f} MB)", flush=True)
 
-# ၁။ Google Shared Drive ရှိ ဖိုင်များကို စစ်ဆေးခြင်း
+    return {"_status": "success"}
+
+# --- Process Files ---
 print(f"[*] Scanning folder: {TARGET_REMOTE_FOLDER}...", flush=True)
 cmd = ["rclone", "lsjson", "-R", "--files-only", TARGET_REMOTE_FOLDER]
 res = subprocess.run(cmd, capture_output=True, text=True)
@@ -157,20 +156,18 @@ for idx, file_info in enumerate(files_metadata, 1):
 
         for part in part_files:
             part_name = os.path.basename(part)
-            print(f"    -> Uploading chunk: {part_name}...", flush=True)
-            up_res = upload_file_web(part, ROOT_FOLDER_ID)
+            up_res = upload_file_chunked(part, ROOT_FOLDER_ID)
 
             if up_res.get("_status") == "success":
-                print(f"    [+] Chunk uploaded successfully!", flush=True)
+                print(f"    [+] Chunk part '{part_name}' uploaded successfully!", flush=True)
                 os.remove(part)
             else:
                 upload_success_all_parts = False
                 break
     else:
-        print(f"  -> Uploading full file to MegaUp Folder ID: {ROOT_FOLDER_ID}...", flush=True)
-        up_res = upload_file_web(local_path, ROOT_FOLDER_ID)
+        up_res = upload_file_chunked(local_path, ROOT_FOLDER_ID)
         if up_res.get("_status") == "success":
-            print(f"  [+] Uploaded Successfully!", flush=True)
+            print(f"  [+] File '{filename}' Uploaded Successfully!", flush=True)
         else:
             upload_success_all_parts = False
 
