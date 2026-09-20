@@ -1,4 +1,5 @@
 import os
+import re
 import glob
 import json
 import time
@@ -6,8 +7,7 @@ import subprocess
 import requests
 from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 
-MEGAUP_KEY1 = os.environ.get("MEGAUP_KEY1")
-MEGAUP_KEY2 = os.environ.get("MEGAUP_KEY2")
+COOKIE_STRING = os.environ.get("MEGAUP_COOKIE", "")
 ROOT_FOLDER_ID = os.environ.get("MEGAUP_FOLDER_ID", "63172")
 REMOTE_NAME = os.environ.get("RCLONE_REMOTE", "ShareDrive")
 
@@ -17,87 +17,54 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 
 SPLIT_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # 4GB
 
-# MegaUp Auth Session State
-AUTH_STATE = {
-    "access_token": None,
-    "account_id": None
+# Default YetiShare browser headers
+COMMON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin": "https://megaup.net",
+    "Referer": "https://megaup.net/",
+    "Cookie": COOKIE_STRING
 }
 
-folder_cache = {}
+session = requests.Session()
+session.headers.update(COMMON_HEADERS)
 
-def get_auth_token():
-    """MegaUp YetiShare v2 API: Authorize with key1 and key2"""
-    url = "https://megaup.net/api/v2/authorize"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    data = {
-        "key1": MEGAUP_KEY1,
-        "key2": MEGAUP_KEY2
-    }
+def parse_upload_params():
+    """MegaUp ပင်မစာမျက်နှာမှ upload handler URL နှင့် session tokens များကို ရှာဖွေခြင်း"""
+    print("[*] Fetching MegaUp Web Upload Session...", flush=True)
     try:
-        r = requests.post(url, data=data, headers=headers, timeout=30)
-        res = r.json()
-        if res.get("_status") == "success":
-            AUTH_STATE["access_token"] = res["data"]["access_token"]
-            AUTH_STATE["account_id"] = str(res["data"]["account_id"])
-            print(f"[+] MegaUp API Authorized Successfully! (Account ID: {AUTH_STATE['account_id']})", flush=True)
-            return True
-        else:
-            print(f"[-] MegaUp Auth Failed: {res}", flush=True)
-            return False
+        r = session.get("https://megaup.net/", timeout=30)
+        html = r.text
+
+        # YetiShare upload url format ရှာဖွေခြင်း
+        upload_url_match = re.search(r'uploadUrl\s*=\s*[\'"]([^\'"]+)[\'"]', html)
+        upload_url = upload_url_match.group(1) if upload_url_match else "https://megaup.net/core/page/ajax/file_upload_handler.ajax.php"
+
+        # cTracker သို့မဟုတ် session token ရှာဖွေခြင်း
+        c_tracker_match = re.search(r'cTracker\s*=\s*[\'"]([^\'"]+)[\'"]', html)
+        c_tracker = c_tracker_match.group(1) if c_tracker_match else ""
+
+        print(f"[+] Web Upload Endpoint: {upload_url}", flush=True)
+        return upload_url, c_tracker
     except Exception as e:
-        print(f"[-] MegaUp Auth Request Exception: {e}", flush=True)
-        return False
+        print(f"[-] Session Fetch Error: {e}", flush=True)
+        return "https://megaup.net/core/page/ajax/file_upload_handler.ajax.php", ""
 
-def get_or_create_megaup_folder(folder_name, parent_id):
-    if not folder_name:
-        return parent_id
+UPLOAD_ENDPOINT, CTRACKER = parse_upload_params()
 
-    cache_key = f"{parent_id}/{folder_name}"
-    if cache_key in folder_cache:
-        return folder_cache[cache_key]
-
-    url = "https://megaup.net/api/v2/folder/create"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    data = {
-        "access_token": AUTH_STATE["access_token"],
-        "account_id": AUTH_STATE["account_id"],
-        "parent_id": str(parent_id),
-        "folder_name": folder_name
-    }
-
-    try:
-        r = requests.post(url, data=data, headers=headers, timeout=30)
-        res = r.json()
-        if res.get("_status") == "success":
-            new_id = str(res["data"]["folder_id"])
-            folder_cache[cache_key] = new_id
-            print(f"  [+] Created MegaUp folder: '{folder_name}' (ID: {new_id})", flush=True)
-            return new_id
-    except Exception as e:
-        print(f"  [-] Folder create warning: {e}", flush=True)
-
-    return parent_id
-
-def upload_file_to_megaup(file_path, folder_id, retries=3):
-    url = "https://megaup.net/api/v2/file/upload"
+def upload_file_web(file_path, folder_id, retries=3):
     file_name = os.path.basename(file_path)
 
     for attempt in range(1, retries + 1):
         try:
             with open(file_path, "rb") as f:
-                # YetiShare API standard field: upload_file
-                encoder = MultipartEncoder(
-                    fields={
-                        "access_token": AUTH_STATE["access_token"],
-                        "account_id": AUTH_STATE["account_id"],
-                        "folder_id": str(folder_id),
-                        "upload_file": (file_name, f, "application/octet-stream")
-                    }
-                )
+                fields = {
+                    "folder_id": str(folder_id),
+                    "cTracker": CTRACKER,
+                    "files[]": (file_name, f, "application/octet-stream")
+                }
+                encoder = MultipartEncoder(fields=fields)
 
                 last_percent = [-10]
                 total_mb = encoder.len / (1024 * 1024)
@@ -110,35 +77,34 @@ def upload_file_to_megaup(file_path, folder_id, retries=3):
                         last_percent[0] = current_percent
 
                 monitor = MultipartEncoderMonitor(encoder, progress_callback)
-                headers = {
-                    "Content-Type": monitor.content_type,
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                }
+                headers = dict(COMMON_HEADERS)
+                headers["Content-Type"] = monitor.content_type
 
-                r = requests.post(url, data=monitor, headers=headers, timeout=3600)
+                r = session.post(UPLOAD_ENDPOINT, data=monitor, headers=headers, timeout=3600)
 
             try:
                 res = r.json()
-                if res.get("_status") == "success":
+                # YetiShare returns an array of uploaded files [{name, size, url, error...}]
+                if isinstance(res, list) and len(res) > 0:
+                    first = res[0]
+                    if "error" not in first:
+                        return {"_status": "success", "data": first}
+                    else:
+                        print(f"    [-] MegaUp Upload Error: {first.get('error')}", flush=True)
+                elif isinstance(res, dict) and res.get("_status") == "success":
                     return res
                 else:
-                    print(f"    [-] API error response: {res}", flush=True)
+                    print(f"    [-] Response: {res}", flush=True)
             except Exception:
-                print(f"    [-] Non-JSON response (Status {r.status_code}): {r.text[:200]}", flush=True)
+                print(f"    [-] Non-JSON response ({r.status_code}): {r.text[:250]}", flush=True)
 
         except Exception as err:
-            print(f"    [!] Upload attempt {attempt}/{retries} failed ({err}). Retrying in 10s...", flush=True)
+            print(f"    [!] Attempt {attempt}/{retries} failed ({err}). Retrying in 10s...", flush=True)
             time.sleep(10)
 
     return {"_status": "error"}
 
-# ၁။ စတင်သည်နှင့် MegaUp Auth အရင်လုပ်ဆောင်ခြင်း
-print("[*] Authenticating with MegaUp API...", flush=True)
-if not get_auth_token():
-    print("[-] Aborting due to authentication failure. Please check MEGAUP_KEY1 and MEGAUP_KEY2 secrets.", flush=True)
-    exit(1)
-
-# ၂။ Shared Drive ရှိ ဖိုင်များကို စစ်ဆေးခြင်း
+# ၁။ Google Shared Drive ရှိ ဖိုင်များကို စစ်ဆေးခြင်း
 print(f"[*] Scanning folder: {TARGET_REMOTE_FOLDER}...", flush=True)
 cmd = ["rclone", "lsjson", "-R", "--files-only", TARGET_REMOTE_FOLDER]
 res = subprocess.run(cmd, capture_output=True, text=True)
@@ -164,16 +130,6 @@ for idx, file_info in enumerate(files_metadata, 1):
     file_size = file_info.get("Size", 0)
     filename = os.path.basename(rel_path)
     file_size_gb = file_size / (1024 ** 3)
-
-    sub_dir = os.path.dirname(rel_path)
-    target_folder_id = ROOT_FOLDER_ID
-
-    if sub_dir:
-        current_parent = ROOT_FOLDER_ID
-        for folder_part in sub_dir.split("/"):
-            if folder_part:
-                current_parent = get_or_create_megaup_folder(folder_part, current_parent)
-        target_folder_id = current_parent
 
     local_path = os.path.join(TEMP_DIR, filename)
     remote_file = f"{TARGET_REMOTE_FOLDER}/{rel_path}"
@@ -202,33 +158,34 @@ for idx, file_info in enumerate(files_metadata, 1):
         for part in part_files:
             part_name = os.path.basename(part)
             print(f"    -> Uploading chunk: {part_name}...", flush=True)
-            up_res = upload_file_to_megaup(part, target_folder_id)
+            up_res = upload_file_web(part, ROOT_FOLDER_ID)
 
             if up_res.get("_status") == "success":
-                print(f"    [+] Chunk uploaded: {up_res.get('data', {}).get('url')}", flush=True)
+                print(f"    [+] Chunk uploaded successfully!", flush=True)
                 os.remove(part)
             else:
                 upload_success_all_parts = False
                 break
     else:
-        print(f"  -> Uploading to MegaUp Folder ID: {target_folder_id}...", flush=True)
-        up_res = upload_file_to_megaup(local_path, target_folder_id)
+        print(f"  -> Uploading full file to MegaUp Folder ID: {ROOT_FOLDER_ID}...", flush=True)
+        up_res = upload_file_web(local_path, ROOT_FOLDER_ID)
         if up_res.get("_status") == "success":
-            print(f"  [+] Uploaded Successfully! URL: {up_res.get('data', {}).get('url')}", flush=True)
+            print(f"  [+] Uploaded Successfully!", flush=True)
         else:
             upload_success_all_parts = False
 
         if os.path.exists(local_path):
             os.remove(local_path)
 
+    # အောင်မြင်မှသာ Drive ထဲက ဖျက်ခြင်း
     if upload_success_all_parts:
         print("  -> Deleting original file from Google Shared Drive...", flush=True)
         del_cmd = subprocess.run(["rclone", "deletefile", remote_file])
         if del_cmd.returncode == 0:
-            print("  [+] Successfully cleaned from Shared Drive!", flush=True)
+            print("  [+] Cleaned from Shared Drive!", flush=True)
         else:
-            print("  [-] Warning: Failed to delete from Shared Drive.", flush=True)
+            print("  [-] Failed to delete from Shared Drive.", flush=True)
     else:
         print("  [!] Keeping file in Shared Drive due to upload failure.", flush=True)
 
-print("\n[+] All pending files processed!", flush=True)
+print("\n[+] All pending backup files processed!", flush=True)
