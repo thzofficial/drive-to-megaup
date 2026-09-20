@@ -1,0 +1,45 @@
+name: Daily Drive to MegaUp Sync
+
+on:
+  schedule:
+    # နေ့စဉ် ည ၁၂:၀၀ နာရီတိုင်း အလိုအလျောက် စစ်ဆေးမည်
+    - cron: '0 0 * * *'
+  workflow_dispatch: # လိုအပ်ပါက Actions tab မှ ကိုယ်တိုင် ခလုတ်နှိပ်ပြီး run နိုင်သည်
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Rclone & Dependencies
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          pip install -r requirements.txt
+
+      - name: Configure Rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONFIG_DATA }}" > ~/.config/rclone/rclone.conf
+
+      - name: Run Sync Script
+        env:
+          MEGAUP_KEY1: ${{ secrets.MEGAUP_KEY1 }}
+          MEGAUP_FOLDER_ID: "63172"
+          RCLONE_REMOTE: "sharedrive:Music" # သင့် remote နာမည်နှင့် folder လမ်းကြောင်း ပြင်ဆင်ပါ
+        run: |
+          python transfer.py
+
+      - name: Commit & Save Upload History
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add uploaded.txt || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update uploaded history [skip ci]" && git push)
