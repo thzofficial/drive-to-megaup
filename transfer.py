@@ -3,115 +3,219 @@ import re
 import glob
 import json
 import time
-import subprocess
+import uuid
+import pathlib
 import unicodedata
+import subprocess
 import requests
-from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 
-COOKIE_STRING = os.environ.get("MEGAUP_COOKIE", "")
+MEGAUP_BASE = "https://megaup.net"
+MEGAUP_COOKIE_FILEHOSTING = os.environ.get("MEGAUP_COOKIE_FILEHOSTING")
+MEGAUP_COOKIE_CFCLEARANCE = os.environ.get("MEGAUP_COOKIE_CFCLEARANCE")
 ROOT_FOLDER_ID = os.environ.get("MEGAUP_FOLDER_ID", "63172")
+MEGAUP_FALLBACK_NODE_URL = os.environ.get("MEGAUP_DIRECT_NODE_URL")
 REMOTE_NAME = os.environ.get("RCLONE_REMOTE", "ShareDrive")
 
 TARGET_REMOTE_FOLDER = f"{REMOTE_NAME}:Backup"
 TEMP_DIR = "/tmp/transfer_cache"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# Cloudflare 100MB body limit ကျော်လွှားရန် 90MB ဖြင့် အပိုင်းခွဲခြင်း
-CHUNK_SPLIT_BYTES = 90 * 1024 * 1024  # 90 MB
+CHUNK_SIZE = 15 * 1024 * 1024  # 15MB chunks
+SPLIT_SIZE_BYTES = 4 * 1024 * 1024 * 1024  # 4GB (Megaup Single File Limit)
 
-COMMON_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "X-Requested-With": "XMLHttpRequest",
-    "Origin": "https://megaup.net",
-    "Referer": "https://megaup.net/",
-    "Cookie": COOKIE_STRING
-}
+_RESOLVED_UPLOAD_URL = None
+folder_cache = {}
 
-session = requests.Session()
-session.headers.update(COMMON_HEADERS)
+def get_authenticated_session() -> requests.Session:
+    if not MEGAUP_COOKIE_FILEHOSTING:
+        raise ValueError("Missing required secret: MEGAUP_COOKIE_FILEHOSTING")
 
-def sanitize_filename(filename):
-    """Unicode စာလုံးထူးများ (ဥပမာ \u2019 curly quote) ကြောင့် Header crash မဖြစ်စေရန် ASCII သို့ ပြောင်းလဲခြင်း"""
-    normalized = unicodedata.normalize('NFKD', filename).encode('ASCII', 'ignore').decode('ASCII')
-    # လုံခြုံစိတ်ချရသော စာလုံးများသာ ထားရှိခြင်း
-    clean_name = re.sub(r'[^\w\s\.\-]', '_', normalized).strip()
-    return clean_name if clean_name else "file_" + str(int(time.time()))
+    session = requests.Session()
+    cookie_parts = [f"filehosting={MEGAUP_COOKIE_FILEHOSTING}"]
+    if MEGAUP_COOKIE_CFCLEARANCE:
+        cookie_parts.append(f"cf_clearance={MEGAUP_COOKIE_CFCLEARANCE}")
 
-def parse_upload_params():
-    print("[*] Fetching MegaUp Web Upload Session...", flush=True)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": f"{MEGAUP_BASE}/",
+        "Origin": MEGAUP_BASE,
+        "Cookie": "; ".join(cookie_parts),
+    })
+    return session
+
+def resolve_upload_url(session: requests.Session) -> str:
+    global _RESOLVED_UPLOAD_URL
+    if _RESOLVED_UPLOAD_URL:
+        return _RESOLVED_UPLOAD_URL
+
     try:
-        r = session.get("https://megaup.net/", timeout=30)
-        html = r.text
+        res = session.get(f"{MEGAUP_BASE}/", timeout=30)
+        res.raise_for_status()
+        match = re.search(r'https?://[a-zA-Z0-9_\-\.]+\.mupload\.store/ajax/file_upload_handler[^\s\'"]*', res.text)
+        if match:
+            _RESOLVED_UPLOAD_URL = match.group(0).replace("&amp;", "&")
+            print(f"[+] Auto-discovered Storage Node: {_RESOLVED_UPLOAD_URL}", flush=True)
+            return _RESOLVED_UPLOAD_URL
+    except Exception as exc:
+        print(f"[-] Dynamic node resolution warning: {exc}", flush=True)
 
-        upload_url_match = re.search(r'uploadUrl\s*=\s*[\'"]([^\'"]+)[\'"]', html)
-        upload_url = upload_url_match.group(1) if upload_url_match else "https://megaup.net/core/page/ajax/file_upload_handler.ajax.php"
+    if MEGAUP_FALLBACK_NODE_URL:
+        print("[+] Using configured MEGAUP_DIRECT_NODE_URL fallback.", flush=True)
+        _RESOLVED_UPLOAD_URL = MEGAUP_FALLBACK_NODE_URL
+        return _RESOLVED_UPLOAD_URL
 
-        c_tracker_match = re.search(r'cTracker\s*=\s*[\'"]([^\'"]+)[\'"]', html)
-        c_tracker = c_tracker_match.group(1) if c_tracker_match else ""
+    raise RuntimeError("Could not resolve Megaup Storage Node. Please provide MEGAUP_DIRECT_NODE_URL secret.")
 
-        print(f"[+] Web Upload Endpoint: {upload_url}", flush=True)
-        return upload_url, c_tracker
-    except Exception as e:
-        print(f"[-] Session Fetch Error: {e}", flush=True)
-        return "https://megaup.net/core/page/ajax/file_upload_handler.ajax.php", ""
+def sanitize_name(name: str) -> str:
+    normalized = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('ASCII')
+    clean = re.sub(r'[\/:*?"<>|]', ' - ', normalized)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    return clean if clean else "file_" + str(int(time.time()))
 
-UPLOAD_ENDPOINT, CTRACKER = parse_upload_params()
+def create_or_get_folder(folder_name: str, parent_id: str = None) -> str:
+    parent_id = str(parent_id or ROOT_FOLDER_ID)
+    clean_folder = sanitize_name(folder_name)[:80]
+    cache_key = f"{parent_id}/{clean_folder}"
+    if cache_key in folder_cache:
+        return folder_cache[cache_key]
 
-def upload_single_file(file_path, folder_id, retries=3):
-    """90MB အောက် ဖိုင်များကို Streaming Multipart စနစ်ဖြင့် တင်ခြင်း"""
-    raw_name = os.path.basename(file_path)
-    safe_name = sanitize_filename(raw_name)
+    session = get_authenticated_session()
+    url = f"{MEGAUP_BASE}/account/ajax/add_edit_folder_process"
+    payload = {
+        "folderName": clean_folder,
+        "parentId": parent_id,
+        "parent_folder_id": parent_id,
+        "isPublic": "1",
+        "password": "",
+        "watermarkPreviews": "0",
+        "showDownloadLinks": "1",
+        "submitme": "1",
+    }
+    headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": f"{MEGAUP_BASE}/",
+        "Origin": MEGAUP_BASE,
+    }
+    try:
+        res = session.post(url, data=payload, headers=headers, timeout=30)
+        data = res.json()
+        if data.get("success") and data.get("folder_id"):
+            new_id = str(data["folder_id"])
+            folder_cache[cache_key] = new_id
+            print(f"  [+] Created Folder '{clean_folder}' -> ID: {new_id}", flush=True)
+            return new_id
+    except Exception as exc:
+        print(f"  [-] Folder create warning for '{clean_folder}': {exc}", flush=True)
 
-    for attempt in range(1, retries + 1):
-        try:
-            with open(file_path, "rb") as f:
-                encoder = MultipartEncoder(
-                    fields={
-                        "folder_id": str(folder_id),
-                        "cTracker": CTRACKER,
-                        "files[]": (safe_name, f, "application/octet-stream")
-                    }
-                )
+    return parent_id
 
-                last_percent = [-10]
-                total_mb = encoder.len / (1024 * 1024)
-
-                def progress_callback(monitor):
-                    current_percent = int((monitor.bytes_read / monitor.len) * 100)
-                    if current_percent >= last_percent[0] + 10 or current_percent == 100:
-                        uploaded_mb = monitor.bytes_read / (1024 * 1024)
-                        print(f"    -> Uploading: {current_percent}% ({uploaded_mb:.1f}/{total_mb:.1f} MB)", flush=True)
-                        last_percent[0] = current_percent
-
-                monitor = MultipartEncoderMonitor(encoder, progress_callback)
-                headers = dict(COMMON_HEADERS)
-                headers["Content-Type"] = monitor.content_type
-
-                r = session.post(UPLOAD_ENDPOINT, data=monitor, headers=headers, timeout=3600)
-
+def move_file_to_folder(file_id: str, target_folder_id: str) -> bool:
+    session = get_authenticated_session()
+    endpoints = [
+        f"{MEGAUP_BASE}/account/ajax/drag_files_into_folder",
+        f"{MEGAUP_BASE}/ajax/drag_files_into_folder",
+    ]
+    payloads = [
+        {"fileIds[]": str(file_id), "folderId": str(target_folder_id)},
+        {"fileIds": str(file_id), "folderId": str(target_folder_id)},
+    ]
+    for ep in endpoints:
+        for p in payloads:
             try:
-                res = r.json()
-                if isinstance(res, list) and len(res) > 0:
-                    first = res[0]
-                    if "error" not in first:
-                        return {"_status": "success", "data": first}
-                    else:
-                        print(f"    [-] MegaUp Upload Error: {first.get('error')}", flush=True)
-                elif isinstance(res, dict) and res.get("_status") == "success":
-                    return res
-                else:
-                    print(f"    [-] Response: {res}", flush=True)
+                res = session.post(ep, data=p, timeout=20)
+                if res.status_code == 200:
+                    return True
             except Exception:
-                print(f"    [-] Non-JSON response ({r.status_code}): {r.text[:250]}", flush=True)
+                pass
+    return False
 
-        except Exception as err:
-            print(f"    [!] Attempt {attempt}/{retries} failed ({err}). Retrying in 10s...", flush=True)
-            time.sleep(10)
+def megaup_upload_file(file_path: str, target_folder_id: str) -> bool:
+    target_id = str(target_folder_id or ROOT_FOLDER_ID)
+    path = pathlib.Path(file_path)
+    total_size = path.stat().st_size
+    file_name = sanitize_name(path.name)
+    c_tracker = str(uuid.uuid4())
 
-    return {"_status": "error"}
+    session = get_authenticated_session()
+    upload_url = resolve_upload_url(session)
 
-# --- Process Files ---
+    bytes_sent = 0
+    res_data = None
+    last_reported = -10
+
+    with open(path, "rb") as fh:
+        while bytes_sent < total_size:
+            chunk_data = fh.read(CHUNK_SIZE)
+            chunk_len = len(chunk_data)
+            if not chunk_data:
+                break
+
+            range_start = bytes_sent
+            range_end = bytes_sent + chunk_len - 1
+
+            form_data = {
+                "folder_id": target_id,
+                "folderId": target_id,
+                "upload_folder": target_id,
+                "upload_folder_id": target_id,
+                "c_tracker": c_tracker,
+                "max_chunk_size": str(CHUNK_SIZE),
+            }
+
+            headers = {
+                "Content-Range": f"bytes {range_start}-{range_end}/{total_size}",
+                "X-Requested-With": "XMLHttpRequest",
+            }
+
+            files = {
+                "files[]": (file_name, chunk_data, "application/octet-stream")
+            }
+
+            # Retry chunk logic
+            chunk_ok = False
+            for attempt in range(1, 4):
+                try:
+                    response = session.post(upload_url, data=form_data, files=files, headers=headers, timeout=180)
+                    response.raise_for_status()
+                    try:
+                        res_data = response.json()
+                    except Exception:
+                        pass
+                    chunk_ok = True
+                    break
+                except Exception as e:
+                    print(f"    [!] Chunk attempt {attempt} failed: {e}. Retrying in 5s...", flush=True)
+                    time.sleep(5)
+
+            if not chunk_ok:
+                print(f"    [-] Chunk upload failed for {file_name}", flush=True)
+                return False
+
+            bytes_sent += chunk_len
+            pct = int((bytes_sent / total_size) * 100)
+            if pct >= last_reported + 10 or pct == 100:
+                print(f"    -> Progress: {pct}% ({bytes_sent/(1024*1024):.1f}/{total_size/(1024*1024):.1f} MB)", flush=True)
+                last_reported = pct
+
+    if isinstance(res_data, list) and len(res_data) > 0:
+        res_data = res_data[0]
+
+    if isinstance(res_data, dict):
+        if res_data.get("error"):
+            print(f"    [-] Megaup Server Error: {res_data.get('error')}", flush=True)
+            return False
+        file_id = res_data.get("file_id")
+        if file_id and target_id != str(ROOT_FOLDER_ID):
+            move_file_to_folder(file_id, target_id)
+
+    return True
+
+# --- Main Flow ---
+print("[*] Initializing MegaUp Session...", flush=True)
+s = get_authenticated_session()
+node_url = resolve_upload_url(s)
+
 print(f"[*] Scanning folder: {TARGET_REMOTE_FOLDER}...", flush=True)
 cmd = ["rclone", "lsjson", "-R", "--files-only", TARGET_REMOTE_FOLDER]
 res = subprocess.run(cmd, capture_output=True, text=True)
@@ -138,8 +242,17 @@ for idx, file_info in enumerate(files_metadata, 1):
     raw_filename = os.path.basename(rel_path)
     file_size_gb = file_size / (1024 ** 3)
 
-    # Unicode အမှား မတက်စေရန် local cache ဖိုင်နာမည်ကို safe ဖြစ်အောင် ပြင်ဆင်ခြင်း
-    safe_local_name = sanitize_filename(raw_filename)
+    # Subfolder Mapping
+    sub_dir = os.path.dirname(rel_path)
+    target_folder_id = ROOT_FOLDER_ID
+    if sub_dir:
+        curr_parent = ROOT_FOLDER_ID
+        for part in sub_dir.split("/"):
+            if part:
+                curr_parent = create_or_get_folder(part, curr_parent)
+        target_folder_id = curr_parent
+
+    safe_local_name = sanitize_name(raw_filename)
     local_path = os.path.join(TEMP_DIR, safe_local_name)
     remote_file = f"{TARGET_REMOTE_FOLDER}/{rel_path}"
 
@@ -153,11 +266,11 @@ for idx, file_info in enumerate(files_metadata, 1):
 
     upload_success_all_parts = True
 
-    # 90MB ထက် ကြီးပါက Cloudflare limit ကျော်လွှားရန် 90MB chunks အဖြစ် အလိုအလျောက် ခွဲခြင်း
-    if file_size > CHUNK_SPLIT_BYTES:
-        print(f"  [!] File size > 90MB. Splitting into 90MB parts for Cloudflare compliance...", flush=True)
+    # 4GB ထက်ကြီးလျှင် 4GB chunks ခွဲမည်
+    if file_size > SPLIT_SIZE_BYTES:
+        print(f"  [!] File size > 4GB. Splitting into 4GB chunks...", flush=True)
         split_prefix = local_path + ".part"
-        subprocess.run(["split", "-b", "90M", "-d", local_path, split_prefix], check=True)
+        subprocess.run(["split", "-b", "4G", "-d", local_path, split_prefix], check=True)
 
         if os.path.exists(local_path):
             os.remove(local_path)
@@ -168,19 +281,18 @@ for idx, file_info in enumerate(files_metadata, 1):
         for part in part_files:
             part_name = os.path.basename(part)
             print(f"    -> Uploading chunk part: {part_name}...", flush=True)
-            up_res = upload_single_file(part, ROOT_FOLDER_ID)
-
-            if up_res.get("_status") == "success":
-                print(f"    [+] Part '{part_name}' uploaded successfully!", flush=True)
+            ok = megaup_upload_file(part, target_folder_id)
+            if ok:
+                print(f"    [+] Chunk uploaded successfully!", flush=True)
                 os.remove(part)
             else:
                 upload_success_all_parts = False
                 break
     else:
-        print(f"  -> Uploading full file to MegaUp Folder ID: {ROOT_FOLDER_ID}...", flush=True)
-        up_res = upload_single_file(local_path, ROOT_FOLDER_ID)
-        if up_res.get("_status") == "success":
-            print(f"  [+] File Uploaded Successfully!", flush=True)
+        print(f"  -> Uploading to MegaUp Folder ID: {target_folder_id}...", flush=True)
+        ok = megaup_upload_file(local_path, target_folder_id)
+        if ok:
+            print(f"  [+] Uploaded Successfully!", flush=True)
         else:
             upload_success_all_parts = False
 
