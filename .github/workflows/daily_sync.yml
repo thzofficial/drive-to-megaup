@@ -24,14 +24,20 @@ jobs:
           pip install -r requirements.txt
 
       - name: Configure Rclone
+        env:
+          CONFIG_B64: ${{ secrets.RCLONE_CONFIG_DATA }}
         run: |
           mkdir -p ~/.config/rclone
-          echo "${{ secrets.RCLONE_CONFIG_DATA }}" > ~/.config/rclone/rclone.conf
+          # Python ဖြင့် Base64 decode လုပ်ပြီး rclone.conf ဖိုင်အဖြစ် သိမ်းဆည်းခြင်း
+          python -c "import os, base64; open(os.path.expanduser('~/.config/rclone/rclone.conf'), 'wb').write(base64.b64decode(os.environ['CONFIG_B64']))"
+          
+          echo "=== Registered Rclone Remotes ==="
+          rclone listremotes
 
       - name: Run Transfer & Cleanup
         env:
           MEGAUP_KEY1: ${{ secrets.MEGAUP_KEY1 }}
           MEGAUP_FOLDER_ID: "63172"
-          RCLONE_REMOTE: "ShareDrive" # သင့် rclone.conf ထဲက remote အမည် အတိအကျ
+          RCLONE_REMOTE: "ShareDrive"
         run: |
           python transfer.py
